@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <title>Free Call – Handler</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script src="https://api.bitrix24.com/api/v1/"></script>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:0;background:#fafafa;color:#222}
+    .wrap{max-width:680px;margin:0 auto;padding:18px}
+    .card{background:#fff;border-radius:14px;box-shadow:0 6px 24px rgba(0,0,0,.08);padding:18px}
+    h2{margin:0 0 12px;font-size:20px}
+    label{display:block;margin:8px 0 4px;font-size:13px;color:#333}
+    input,select,button,textarea{width:100%;padding:10px 12px;border:1px solid #ddd;border-radius:10px;font:inherit;background:#fff}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .btn{background:#111;color:#fff;border:0;cursor:pointer}
+    .muted{color:#666;font-size:13px}
+    .log{white-space:pre-wrap;background:#0b1020;color:#e6edf3;border-radius:10px;padding:10px;margin-top:12px;max-height:220px;overflow:auto}
+    .ok{color:#2e7d32}.warn{color:#b26a00}.err{color:#b00020}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h2>Ücretsiz Arama</h2>
+      <p class="muted" id="ctxInfo">Bağlam yükleniyor…</p>
+
+      <div class="row">
+        <div>
+          <label>Kayıt Adı</label>
+          <input id="entityName" readonly>
+        </div>
+        <div>
+          <label>Kayıt Tipi</label>
+          <input id="entityType" readonly>
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>Müşteri Telefonu</label>
+          <select id="customerPhone"></select>
+        </div>
+        <div>
+          <label>Ajan Telefonu</label>
+          <input id="agentPhone" placeholder="+90XXXXXXXXXX">
+        </div>
+      </div>
+
+      <div style="margin-top:12px">
+        <button id="btnCall" class="btn">Ara</button>
+      </div>
+
+      <div class="log" id="log"></div>
+    </div>
+  </div>
+
+  <script>
+    /* ====== CONFIG ====== */
+    // Dış arama servisin: POST bekler (örnek payload aşağıda)
+    const CALLBACK_URL = "https://your-callback.example.com/callback";
+    // Gerekirse basit auth header
+    const AUTH_HEADER = null; // örn: "Bearer YOUR_TOKEN"
+
+    // İstersen ajan no’yu sabitle (inputu gizlemek istersen DOM'dan display:none yap)
+    const DEFAULT_AGENT_PHONE = ""; // örn: "+90XXXXXXXXXX"
+
+    /* ====== Helpers ====== */
+    const $ = id => document.getElementById(id);
+    const log = (m, lvl)=> {
+      const el = $("log");
+      const line = document.createElement('div');
+      if (lvl) line.classList.add(lvl);
+      line.textContent = (typeof m==='string')? m : JSON.stringify(m, null, 2);
+      el.appendChild(line); el.scrollTop = el.scrollHeight;
+    };
+    const normPhone = p => (p||"").toString().replace(/\s+/g,'');
+    const digits = p => normPhone(p).replace(/[^\d]/g,'');
+    const isE164ish = p => /^\+?\d{7,15}$/.test(normPhone(p));
+
+    /* ====== BX24 Init & Context ====== */
+    let ctx = { placement:null, entityTypeId:null, entityId:null };
+    let entity = { name:"", phones:[], typeLabel:"" };
+
+    BX24.init(function(){
+      BX24.placement.info(async function(info){
+        try {
+          ctx.placement = info.placement; // örn: CRM_CONTACT_DETAIL_TAB, CRM_LEAD_DETAIL_TOOLBAR
+          const opt = info.options || {};
+          // Bazı placement'larda ID, bazılarında ENTITY_ID olur
+          ctx.entityId = Number(opt.ID || opt.ENTITY_ID || 0);
+
+          // Placement’tan entity tipini/etiketini çıkart
+          if (/LEAD/i.test(ctx.placement)) { ctx.entityTypeId = 1; entity.typeLabel = "Lead"; }
+          else if (/CONTACT/i.test(ctx.placement)) { ctx.entityTypeId = 3; entity.typeLabel = "Contact"; }
+          else if (/DEAL/i.test(ctx.placement)) { ctx.entityTypeId = 2; entity.typeLabel = "Deal"; }
+          else { entity.typeLabel = "Bilinmiyor"; }
+
+          $("entityType").value = entity.typeLabel;
+          $("ctxInfo").textContent = `Placement: ${ctx.placement} | ID: ${ctx.entityId}`;
+
+          if (!ctx.entityId) {
+            log("Geçerli kayıt ID'si alınamadı.", "err");
+            return;
+          }
+
+          // Kayıt verisini getir
+          await loadEntityData();
+          fillUI();
+        } catch(e){
+          log(e.message || e, "err");
+        }
+      });
+    });
+
+    function fillUI(){
+      $("entityName").value = entity.name || "";
+      const sel = $("customerPhone");
+      sel.innerHTML = "";
+      if (entity.phones.length === 0) {
+        const op = document.createElement("option");
+        op.value = ""; op.textContent = "Telefon bulunamadı";
+        sel.appendChild(op);
+      } else {
+        entity.phones.forEach(p=>{
+          const op = document.createElement("option");
+          op.value = p; op.textContent = p;
+          sel.appendChild(op);
+        });
+      }
+      $("agentPhone").value = DEFAULT_AGENT_PHONE || $("agentPhone").value;
+    }
+
+    async function loadEntityData(){
+      if (ctx.entityTypeId === 1) { // Lead
+        await new Promise((resolve) => {
+          BX24.callMethod("crm.lead.get", { id: ctx.entityId }, function(r){
+            if (r.error()) { log(r.error(), "err"); return resolve(); }
+            const lead = r.data() || {};
+            entity.name = lead.TITLE || lead.NAME || "";
+            entity.phones = (lead.PHONE || []).map(x=>x.VALUE).filter(Boolean);
+            log({lead}, "ok");
+            resolve();
+          });
+        });
+      } else if (ctx.entityTypeId === 3) { // Contact
+        await new Promise((resolve) => {
+          BX24.callMethod("crm.contact.get", { id: ctx.entityId }, function(r){
+            if (r.error()) { log(r.error(), "err"); return resolve(); }
+            const c = r.data() || {};
+            entity.name = [c.NAME, c.LAST_NAME].filter(Boolean).join(" ") || (c.HONORIFIC || "");
+            entity.phones = (c.PHONE || []).map(x=>x.VALUE).filter(Boolean);
+            log({contact:c}, "ok");
+            resolve();
+          });
+        });
+      } else {
+        // Deal vs. için gerekiyorsa genişletebilirsin
+        entity.name = "";
+        entity.phones = [];
+      }
+    }
+
+    /* ====== External Call Trigger ====== */
+    async function triggerCallback(agentPhone, customerPhone){
+      const payload = {
+        agentPhone,          // "+90..." (ajan dış hattı)
+        customerPhone,       // "+90..." (müşteri)
+        entityTypeId: ctx.entityTypeId, // 1=Lead, 3=Contact
+        entityId: ctx.entityId,
+        source: "bitrix-widget"
+      };
+      const headers = { "Content-Type":"application/json" };
+      if (AUTH_HEADER) headers["Authorization"] = AUTH_HEADER;
+
+      const res = await fetch(CALLBACK_URL, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload)
+      });
+      const text = await res.text();
+      let json = null;
+      try { json = text ? JSON.parse(text) : {}; } catch(_){}
+      if (!res.ok) {
+        throw new Error(`Callback HTTP ${res.status} – ${text.slice(0,200)}`);
+      }
+      return json || { ok:true, raw:text };
+    }
+
+    /* ====== Activity Note ====== */
+    function ownerTypeFromId(id){
+      // Bitrix: 1=Lead, 2=Deal, 3=Contact, 4=Company
+      return Number(id) || 1;
+    }
+    function addNote(text){
+      return new Promise((resolve)=>{
+        BX24.callMethod("crm.activity.add", {
+          fields: {
+            OWNER_TYPE_ID: ownerTypeFromId(ctx.entityTypeId),
+            OWNER_ID: ctx.entityId,
+            TYPE_ID: 4, // generic note
+            SUBJECT: "Ücretsiz Arama (Dış Servis)",
+            DESCRIPTION: text,
+            DEADLINE: new Date().toISOString()
+          }
+        }, function(r){
+          if (r.error()) { log(r.error(), "err"); return resolve(false); }
+          log({activityId:r.data()}, "ok");
+          resolve(true);
+        });
+      });
+    }
+
+    /* ====== UI Handlers ====== */
+    $("btnCall").onclick = async () => {
+      try {
+        const agent = normPhone($("agentPhone").value);
+        const customer = normPhone($("customerPhone").value);
+
+        if (!ctx.entityId) throw new Error("Kayıt ID okunamadı.");
+        if (!customer || !isE164ish(customer)) throw new Error("Müşteri telefonu eksik veya hatalı (E.164: +90...)");
+        if (!agent || !isE164ish(agent))       throw new Error("Ajan telefonu eksik veya hatalı (E.164: +90...)");
+
+        $("btnCall").disabled = true;
+        log("Dış arama çağrısı gönderiliyor…");
+
+        const result = await triggerCallback(agent, customer);
+        log(result, "ok");
+
+        await addNote(`Dış arama tetiklendi.\nAjan: ${agent}\nMüşteri: ${customer}\nSonuç: ${JSON.stringify(result)}`);
+      } catch(e) {
+        log(e.message || e, "err");
+        await addNote(`Dış arama HATASI: ${e.message || e}`);
+      } finally {
+        $("btnCall").disabled = false;
+      }
+    };
+  </script>
+</body>
+</html>
